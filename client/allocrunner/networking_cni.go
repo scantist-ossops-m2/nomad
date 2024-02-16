@@ -17,12 +17,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	cni "github.com/containerd/go-cni"
 	cnilibrary "github.com/containernetworking/cni/libcni"
 	"github.com/coreos/go-iptables/iptables"
+	consulIPTables "github.com/hashicorp/consul/sdk/iptables"
 	log "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/plugins/drivers"
@@ -47,26 +49,28 @@ type cniNetworkConfigurator struct {
 	cni                     cni.CNI
 	cniConf                 []byte
 	ignorePortMappingHostIP bool
+	nodeAttrs               map[string]string
 
 	rand   *rand.Rand
 	logger log.Logger
 }
 
-func newCNINetworkConfigurator(logger log.Logger, cniPath, cniInterfacePrefix, cniConfDir, networkName string, ignorePortMappingHostIP bool) (*cniNetworkConfigurator, error) {
+func newCNINetworkConfigurator(logger log.Logger, cniPath, cniInterfacePrefix, cniConfDir, networkName string, ignorePortMappingHostIP bool, nodeAttrs map[string]string) (*cniNetworkConfigurator, error) {
 	cniConf, err := loadCNIConf(cniConfDir, networkName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load CNI config: %v", err)
 	}
 
-	return newCNINetworkConfiguratorWithConf(logger, cniPath, cniInterfacePrefix, ignorePortMappingHostIP, cniConf)
+	return newCNINetworkConfiguratorWithConf(logger, cniPath, cniInterfacePrefix, ignorePortMappingHostIP, cniConf, nodeAttrs)
 }
 
-func newCNINetworkConfiguratorWithConf(logger log.Logger, cniPath, cniInterfacePrefix string, ignorePortMappingHostIP bool, cniConf []byte) (*cniNetworkConfigurator, error) {
+func newCNINetworkConfiguratorWithConf(logger log.Logger, cniPath, cniInterfacePrefix string, ignorePortMappingHostIP bool, cniConf []byte, nodeAttrs map[string]string) (*cniNetworkConfigurator, error) {
 	conf := &cniNetworkConfigurator{
 		cniConf:                 cniConf,
 		rand:                    rand.New(rand.NewSource(time.Now().Unix())),
 		logger:                  logger,
 		ignorePortMappingHostIP: ignorePortMappingHostIP,
+		nodeAttrs:               nodeAttrs,
 	}
 	if cniPath == "" {
 		if cniPath = os.Getenv(envCNIPath); cniPath == "" {
@@ -88,11 +92,35 @@ func newCNINetworkConfiguratorWithConf(logger log.Logger, cniPath, cniInterfaceP
 	return conf, nil
 }
 
+const (
+	ConsulIPTablesConfigEnvVar = "IPTABLES_CONFIG"
+)
+
 // Setup calls the CNI plugins with the add action
 func (c *cniNetworkConfigurator) Setup(ctx context.Context, alloc *structs.Allocation, spec *drivers.NetworkIsolationSpec) (*structs.AllocNetworkStatus, error) {
 	if err := c.ensureCNIInitialized(); err != nil {
 		return nil, err
 	}
+	argsMap := map[string]string{
+		"IgnoreUnknown": "true",
+	}
+
+	portMapping, portLabels := getPortMapping(alloc, c.ignorePortMappingHostIP)
+
+	tproxyArgs, err := c.setupTransparentProxyArgs(alloc, spec, portMapping, portLabels)
+	if err != nil {
+		return nil, err
+	}
+	if tproxyArgs != nil {
+		iptablesCfg, err := json.Marshal(tproxyArgs)
+		if err != nil {
+			return nil, err
+		}
+		argsMap[ConsulIPTablesConfigEnvVar] = string(iptablesCfg)
+	}
+
+	// TODO(tgross) drop log to Debug or Trace
+	c.logger.Info("CNI_ARGS", "args", argsMap)
 
 	// Depending on the version of bridge cni plugin used, a known race could occure
 	// where two alloc attempt to create the nomad bridge at the same time, resulting
@@ -102,7 +130,10 @@ func (c *cniNetworkConfigurator) Setup(ctx context.Context, alloc *structs.Alloc
 	var res *cni.Result
 	for attempt := 1; ; attempt++ {
 		var err error
-		if res, err = c.cni.Setup(ctx, alloc.ID, spec.Path, cni.WithCapabilityPortMap(getPortMapping(alloc, c.ignorePortMappingHostIP))); err != nil {
+		if res, err = c.cni.Setup(ctx, alloc.ID, spec.Path,
+			cni.WithCapabilityPortMap(portMapping),
+			cni.WithLabels(argsMap),
+		); err != nil {
 			c.logger.Warn("failed to configure network", "error", err, "attempt", attempt)
 			switch attempt {
 			case 1:
@@ -123,8 +154,156 @@ func (c *cniNetworkConfigurator) Setup(ctx context.Context, alloc *structs.Alloc
 		c.logger.Debug("received result from CNI", "result", string(resultJSON))
 	}
 
-	return c.cniToAllocNet(res)
+	allocNet, err := c.cniToAllocNet(res)
+	if err != nil {
+		return nil, err
+	}
 
+	// prepend the Consul DNS to the nameservers, if we have it; we don't need
+	// the port because the iptables rule redirects port 53 traffic to it
+	if tproxyArgs != nil && tproxyArgs.ConsulDNSIP != "" {
+		allocNet.DNS.Servers = append([]string{tproxyArgs.ConsulDNSIP},
+			allocNet.DNS.Servers...)
+	}
+
+	return allocNet, nil
+}
+
+func (c *cniNetworkConfigurator) setupTransparentProxyArgs(alloc *structs.Allocation, spec *drivers.NetworkIsolationSpec, portMapping []cni.PortMapping, portLabels map[string]int) (*consulIPTables.Config, error) {
+	var tproxy *structs.ConsulTransparentProxy
+	var cluster string
+
+	exposePorts := []string{}
+	outboundPorts := []string{}
+	proxyInboundPort := 20000
+
+	// TODO(tgross): this default value is from the default Consul service defaults;
+	// if the Consul cluster admin has changed it, all jobs will need to add an
+	// explicit outbound port, which would be sad. What can we do about that?
+	proxyOutboundPort := 15001
+
+	tg := alloc.Job.LookupTaskGroup(alloc.TaskGroup)
+	for _, svc := range tg.Services {
+		if svc.Connect.HasTransparentProxy() {
+
+			envoyPortLabel := "connect-proxy-" + svc.Name
+			if idx, ok := portLabels[envoyPortLabel]; ok {
+				proxyInboundPort = int(portMapping[idx].HostPort)
+			}
+
+			tproxy = svc.Connect.SidecarService.Proxy.TransparentProxy
+			cluster = svc.Cluster
+
+			// TODO(tgross): the user shouldn't need to set upstreams but do we
+			// need to handle them specially if the user *has* set them, or
+			// should we return an error for that during job submission?
+			//
+			// for _, upstream := range svc.Connect.SidecarService.Proxy.Upstreams {
+			// 	...
+			// }
+
+			for _, port := range tproxy.ExcludeOutboundPorts {
+				outboundPorts = append(outboundPorts, string(port))
+			}
+
+			if tproxy.OutboundPort != 0 {
+				proxyOutboundPort = int(tproxy.OutboundPort)
+			}
+
+			// ExcludeInboundPorts can be either a numeric port number or a port
+			// label that we need to convert into a port number
+			for _, portLabel := range tproxy.ExcludeInboundPorts {
+				if _, err := strconv.ParseUint(portLabel, 10, 64); err == nil {
+					exposePorts = append(exposePorts, portLabel)
+					continue
+				}
+				if idx, ok := portLabels[portLabel]; ok {
+					// TODO: should this be the HostPort or the ContainerPort?
+					exposePorts = append(exposePorts,
+						strconv.FormatInt(int64(portMapping[idx].HostPort), 10))
+				}
+			}
+
+			// we also exclude Expose.Paths which will get used for health check
+			if svc.Connect.SidecarService.Proxy.Expose != nil {
+				for _, path := range svc.Connect.SidecarService.Proxy.Expose.Paths {
+					if idx, ok := portLabels[path.ListenerPort]; ok {
+						exposePorts = append(exposePorts,
+							strconv.FormatInt(int64(portMapping[idx].HostPort), 10))
+					}
+				}
+			}
+
+			// only one Connect block is allowed with tproxy and this will have
+			// been validated on job registration
+			break
+		}
+	}
+
+	if tproxy != nil {
+		var dnsAddr string
+		var dnsPort int
+		if !tproxy.NoDNS {
+			dnsAddr, dnsPort = c.dnsFromAttrs(cluster)
+		}
+
+		consulIPTablesCfgMap := &consulIPTables.Config{
+			// Traffic in the DNSChain is directed to the Consul DNS Service IP.
+			// For outbound TCP and UDP traffic going to port 53 (DNS), jump to
+			// the DNSChain. Only redirect traffic that's going to consul's DNS
+			// IP.
+			ConsulDNSIP:   dnsAddr,
+			ConsulDNSPort: dnsPort,
+
+			// Don't redirect proxy traffic back to itself, return it to the
+			// next chain for processing.
+			ProxyUserID: "101", // TODO(tgross): hard-coded from Envoy container image!?
+
+			// Redirects inbound TCP traffic hitting the PROXY_IN_REDIRECT chain
+			// to Envoy's inbound listener port.
+			ProxyInboundPort: proxyInboundPort,
+
+			// Redirects outbound TCP traffic hitting PROXY_REDIRECT chain to
+			// Envoy's outbound listener port.
+			ProxyOutboundPort: proxyOutboundPort,
+
+			ExcludeInboundPorts:  exposePorts,
+			ExcludeOutboundPorts: outboundPorts,
+			ExcludeOutboundCIDRs: tproxy.ExcludeOutboundCIDRs,
+			ExcludeUIDs:          tproxy.ExcludeUIDs,
+			NetNS:                spec.Path,
+		}
+
+		return consulIPTablesCfgMap, nil
+
+	}
+	return nil, nil
+}
+
+func (c *cniNetworkConfigurator) dnsFromAttrs(cluster string) (string, int) {
+
+	var dnsAddrAttr, dnsPortAttr string
+	if cluster == structs.ConsulDefaultCluster || cluster == "" {
+		dnsAddrAttr = "consul.dns.addr"
+		dnsPortAttr = "consul.dns.port"
+	} else {
+		dnsAddrAttr = "consul." + cluster + ".dns.addr"
+		dnsPortAttr = "consul." + cluster + ".dns.port"
+	}
+
+	dnsAddr, ok := c.nodeAttrs[dnsAddrAttr]
+	if !ok || dnsAddr == "" {
+		return "", 0
+	}
+	dnsPort, ok := c.nodeAttrs[dnsPortAttr]
+	if !ok || dnsPort == "0" || dnsPort == "-1" {
+		return "", 0
+	}
+	port, err := strconv.ParseInt(dnsPort, 10, 64)
+	if err != nil {
+		return "", 0 // note: this will have been checked in fingerprint
+	}
+	return dnsAddr, int(port)
 }
 
 // cniToAllocNet converts a cni.Result to an AllocNetworkStatus or returns an
@@ -237,7 +416,9 @@ func (c *cniNetworkConfigurator) Teardown(ctx context.Context, alloc *structs.Al
 		return err
 	}
 
-	if err := c.cni.Remove(ctx, alloc.ID, spec.Path, cni.WithCapabilityPortMap(getPortMapping(alloc, c.ignorePortMappingHostIP))); err != nil {
+	portMap, _ := getPortMapping(alloc, c.ignorePortMappingHostIP)
+
+	if err := c.cni.Remove(ctx, alloc.ID, spec.Path, cni.WithCapabilityPortMap(portMap)); err != nil {
 		// create a real handle to iptables
 		ipt, iptErr := iptables.New()
 		if iptErr != nil {
@@ -344,8 +525,9 @@ func (c *cniNetworkConfigurator) ensureCNIInitialized() error {
 
 // getPortMapping builds a list of portMapping structs that are used as the
 // portmapping capability arguments for the portmap CNI plugin
-func getPortMapping(alloc *structs.Allocation, ignoreHostIP bool) []cni.PortMapping {
+func getPortMapping(alloc *structs.Allocation, ignoreHostIP bool) ([]cni.PortMapping, map[string]int) {
 	var ports []cni.PortMapping
+	labels := map[string]int{}
 
 	if len(alloc.AllocatedResources.Shared.Ports) == 0 && len(alloc.AllocatedResources.Shared.Networks) > 0 {
 		for _, network := range alloc.AllocatedResources.Shared.Networks {
@@ -359,6 +541,7 @@ func getPortMapping(alloc *structs.Allocation, ignoreHostIP bool) []cni.PortMapp
 						ContainerPort: int32(port.To),
 						Protocol:      proto,
 					})
+					labels[port.Label] = len(ports) - 1
 				}
 			}
 		}
@@ -377,8 +560,9 @@ func getPortMapping(alloc *structs.Allocation, ignoreHostIP bool) []cni.PortMapp
 					portMapping.HostIP = port.HostIP
 				}
 				ports = append(ports, portMapping)
+				labels[port.Label] = len(ports) - 1
 			}
 		}
 	}
-	return ports
+	return ports, labels
 }
