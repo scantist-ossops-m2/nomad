@@ -157,12 +157,13 @@ func (st *SidecarTask) Canonicalize() {
 
 // ConsulProxy represents a Consul Connect sidecar proxy jobspec block.
 type ConsulProxy struct {
-	LocalServiceAddress string                 `mapstructure:"local_service_address" hcl:"local_service_address,optional"`
-	LocalServicePort    int                    `mapstructure:"local_service_port" hcl:"local_service_port,optional"`
-	Expose              *ConsulExposeConfig    `mapstructure:"expose" hcl:"expose,block"`
-	ExposeConfig        *ConsulExposeConfig    // Deprecated: only to maintain backwards compatibility. Use Expose instead.
-	Upstreams           []*ConsulUpstream      `hcl:"upstreams,block"`
-	Config              map[string]interface{} `hcl:"config,block"`
+	LocalServiceAddress string                  `mapstructure:"local_service_address" hcl:"local_service_address,optional"`
+	LocalServicePort    int                     `mapstructure:"local_service_port" hcl:"local_service_port,optional"`
+	Expose              *ConsulExposeConfig     `mapstructure:"expose" hcl:"expose,block"`
+	ExposeConfig        *ConsulExposeConfig     // Deprecated: only to maintain backwards compatibility. Use Expose instead.
+	Upstreams           []*ConsulUpstream       `hcl:"upstreams,block"`
+	TransparentProxy    *ConsulTransparentProxy `mapstructure:"transparent_proxy" hcl:"transparent_proxy,block"`
+	Config              map[string]interface{}  `hcl:"config,block"`
 }
 
 func (cp *ConsulProxy) Canonicalize() {
@@ -175,6 +176,8 @@ func (cp *ConsulProxy) Canonicalize() {
 	if len(cp.Upstreams) == 0 {
 		cp.Upstreams = nil
 	}
+
+	cp.TransparentProxy.Canonicalize()
 
 	for _, upstream := range cp.Upstreams {
 		upstream.Canonicalize()
@@ -260,6 +263,27 @@ func (cu *ConsulUpstream) Canonicalize() {
 	cu.MeshGateway.Canonicalize()
 	if len(cu.Config) == 0 {
 		cu.Config = nil
+	}
+}
+
+type PortNumber = uint16
+
+type ConsulTransparentProxy struct {
+	UID                  string       `mapstructure:"uid" hcl:"uid,optional"`
+	OutboundPort         PortNumber   `mapstructure:"outbound_port" hcl:"outbound_port,optional"`
+	ExcludeInboundPorts  []string     `mapstructure:"exclude_inbound_ports" hcl:"exclude_inbound_ports,optional"`
+	ExcludeOutboundPorts []PortNumber `mapstructure:"exclude_outbound_ports" hcl:"exclude_outbound_ports,optional"`
+	ExcludeOutboundCIDRs []string     `mapstructure:"exclude_outbound_cidrs" hcl:"exclude_outbound_cidrs,optional"`
+	ExcludeUIDs          []string     `mapstructure:"exclude_uids" hcl:"exclude_uids,optional"`
+	NoDNS                bool         `mapstructure:"no_dns" hcl:"no_dns,optional"`
+}
+
+func (tp *ConsulTransparentProxy) Canonicalize() {
+	if tp == nil {
+		return
+	}
+	if len(tp.ExcludeInboundPorts) == 0 {
+		tp.ExcludeInboundPorts = nil
 	}
 }
 

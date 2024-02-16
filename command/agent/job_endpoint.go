@@ -1851,6 +1851,7 @@ func apiConnectSidecarServiceProxyToStructs(in *api.ConsulProxy) *structs.Consul
 		LocalServicePort:    in.LocalServicePort,
 		Upstreams:           apiUpstreamsToStructs(in.Upstreams),
 		Expose:              apiConsulExposeConfigToStructs(expose),
+		TransparentProxy:    apiConnectTransparentProxyToStructs(in.TransparentProxy),
 		Config:              maps.Clone(in.Config),
 	}
 }
@@ -1899,6 +1900,21 @@ func apiConsulExposeConfigToStructs(in *api.ConsulExposeConfig) *structs.ConsulE
 
 	return &structs.ConsulExposeConfig{
 		Paths: apiConsulExposePathsToStructs(paths),
+	}
+}
+
+func apiConnectTransparentProxyToStructs(in *api.ConsulTransparentProxy) *structs.ConsulTransparentProxy {
+	if in == nil {
+		return nil
+	}
+	return &structs.ConsulTransparentProxy{
+		UID:                  in.UID,
+		OutboundPort:         in.OutboundPort,
+		ExcludeInboundPorts:  in.ExcludeInboundPorts,
+		ExcludeOutboundPorts: in.ExcludeOutboundPorts,
+		ExcludeOutboundCIDRs: in.ExcludeOutboundCIDRs,
+		ExcludeUIDs:          in.ExcludeUIDs,
+		NoDNS:                in.NoDNS,
 	}
 }
 

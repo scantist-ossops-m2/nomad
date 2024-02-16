@@ -1186,6 +1186,12 @@ func (c *ConsulConnect) IsMesh() bool {
 	return c.IsGateway() && c.Gateway.Mesh != nil
 }
 
+func (c *ConsulConnect) HasTransparentProxy() bool {
+	return c.HasSidecar() &&
+		c.SidecarService.Proxy != nil &&
+		c.SidecarService.Proxy.TransparentProxy != nil
+}
+
 // Validate that the Connect block represents exactly one of:
 // - Connect non-native service sidecar proxy
 // - Connect native service
@@ -1508,6 +1514,11 @@ type ConsulProxy struct {
 	// used by task-group level service checks using HTTP or gRPC protocols.
 	Expose *ConsulExposeConfig
 
+	// TransparentProxy configures the Envoy sidecar to use "transparent
+	// proxying", which creates IP tables rules inside the network namespace to
+	// ensure traffic flows thru the Envoy proxy
+	TransparentProxy *ConsulTransparentProxy
+
 	// Config is a proxy configuration. It is opaque to Nomad and passed
 	// directly to Consul.
 	Config map[string]interface{}
@@ -1524,6 +1535,7 @@ func (p *ConsulProxy) Copy() *ConsulProxy {
 		LocalServicePort:    p.LocalServicePort,
 		Expose:              p.Expose.Copy(),
 		Upstreams:           slices.Clone(p.Upstreams),
+		TransparentProxy:    p.TransparentProxy.Copy(),
 		Config:              maps.Clone(p.Config),
 	}
 }
@@ -1547,6 +1559,10 @@ func (p *ConsulProxy) Equal(o *ConsulProxy) bool {
 	}
 
 	if !upstreamsEquals(p.Upstreams, o.Upstreams) {
+		return false
+	}
+
+	if !p.TransparentProxy.Equal(o.TransparentProxy) {
 		return false
 	}
 
@@ -1710,6 +1726,7 @@ func (e *ConsulExposeConfig) Copy() *ConsulExposeConfig {
 	}
 	paths := make([]ConsulExposePath, len(e.Paths))
 	copy(paths, e.Paths)
+
 	return &ConsulExposeConfig{
 		Paths: paths,
 	}

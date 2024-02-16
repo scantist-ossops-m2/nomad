@@ -3,6 +3,10 @@
 
 package structs
 
+import (
+	"slices"
+)
+
 // ConsulConfigEntries represents Consul ConfigEntry definitions from a job for
 // a single Consul namespace.
 type ConsulConfigEntries struct {
@@ -42,4 +46,63 @@ func (j *Job) ConfigEntries() map[string]*ConsulConfigEntries {
 	}
 
 	return collection
+}
+
+type PortNumber = uint16
+
+// ConsulTransparentProxy is used to configure the Envoy sidecar for
+// "transparent proxying", which creates IP tables rules inside the network
+// namespace to ensure traffic flows thru the Envoy proxy
+type ConsulTransparentProxy struct {
+	UID                  string
+	OutboundPort         PortNumber
+	ExcludeInboundPorts  []string // can be Port.Label or Port.Value
+	ExcludeOutboundPorts []PortNumber
+	ExcludeOutboundCIDRs []string // TODO: netip.Prefix?
+	ExcludeUIDs          []string
+	NoDNS                bool
+}
+
+func (tp *ConsulTransparentProxy) Copy() *ConsulTransparentProxy {
+	if tp == nil {
+		return nil
+	}
+	ntp := new(ConsulTransparentProxy)
+	*ntp = *tp
+
+	ntp.ExcludeInboundPorts = slices.Clone(tp.ExcludeInboundPorts)
+	ntp.ExcludeOutboundPorts = slices.Clone(tp.ExcludeOutboundPorts)
+	ntp.ExcludeOutboundCIDRs = slices.Clone(tp.ExcludeOutboundCIDRs)
+	ntp.ExcludeUIDs = slices.Clone(tp.ExcludeUIDs)
+
+	return ntp
+}
+
+func (tp *ConsulTransparentProxy) Equal(o *ConsulTransparentProxy) bool {
+	if tp == nil || o == nil {
+		return tp == o
+	}
+	if tp.UID != o.UID {
+		return false
+	}
+	if tp.OutboundPort != o.OutboundPort {
+		return false
+	}
+	if !slices.Equal(tp.ExcludeInboundPorts, o.ExcludeInboundPorts) {
+		return false
+	}
+	if !slices.Equal(tp.ExcludeOutboundPorts, o.ExcludeOutboundPorts) {
+		return false
+	}
+	if !slices.Equal(tp.ExcludeOutboundCIDRs, o.ExcludeOutboundCIDRs) {
+		return false
+	}
+	if !slices.Equal(tp.ExcludeUIDs, o.ExcludeUIDs) {
+		return false
+	}
+	if tp.NoDNS != o.NoDNS {
+		return false
+	}
+
+	return false
 }
