@@ -55,7 +55,7 @@ type JobStatusAlloc struct {
 
 type JobStatusDeployment struct {
 	Canary  bool
-	Healthy bool
+	Healthy *bool
 }
 
 // JobServiceRegistrationsRequest is the request object used to list all

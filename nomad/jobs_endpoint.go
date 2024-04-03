@@ -283,7 +283,12 @@ func UIJobFromJob(ws memdb.WatchSet, store *state.StateStore, job *structs.Job, 
 		}
 		if a.DeploymentStatus != nil {
 			alloc.DeploymentStatus.Canary = a.DeploymentStatus.IsCanary()
-			alloc.DeploymentStatus.Healthy = a.DeploymentStatus.IsHealthy()
+			if a.DeploymentStatus.HasHealth() {
+				healthy := a.DeploymentStatus.IsHealthy()
+				alloc.DeploymentStatus.Healthy = &healthy
+			} else {
+				alloc.DeploymentStatus.Healthy = nil
+			}
 		}
 		uiJob.Allocs = append(uiJob.Allocs, alloc)
 	}
