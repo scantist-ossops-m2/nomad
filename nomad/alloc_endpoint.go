@@ -634,15 +634,19 @@ func (a *Alloc) signServices(
 ) (widFound bool, err error) {
 	wid := idReq.WIHandle
 
+	a.logger.Warn("signServices for", "wid", wid)
+
 	// services can be on the level of task groups or tasks
 	for _, tg := range job.TaskGroups {
 		for _, service := range tg.Services {
+			a.logger.Warn("service.IdentityHandle is", "handle", service.IdentityHandle())
 			if service.IdentityHandle().Equal(wid) {
 				return true, a.signIdentities(alloc, service.Identity, idReq, reply, now)
 			}
 		}
 		for _, task := range tg.Tasks {
 			for _, service := range task.Services {
+				a.logger.Warn("service.IdentityHandle is", "handle", service.IdentityHandle())
 				if service.IdentityHandle().Equal(wid) {
 					return true, a.signIdentities(alloc, service.Identity, idReq, reply, now)
 				}

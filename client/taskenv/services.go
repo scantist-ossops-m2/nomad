@@ -4,7 +4,6 @@
 package taskenv
 
 import (
-	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -224,19 +223,11 @@ func interpolateTaskResources(taskEnv *TaskEnv, resources *structs.Resources) {
 	}
 }
 
-func interpolateIdentity(taskEnv *TaskEnv, origIdentity *structs.WorkloadIdentity) *structs.WorkloadIdentity {
-	if origIdentity == nil {
-		return nil
+func InterpolateWIHandle(taskEnv *TaskEnv, orig structs.WIHandle) structs.WIHandle {
+	return structs.WIHandle{
+		IdentityName:                   orig.IdentityName,
+		WorkloadIdentifier:             orig.WorkloadIdentifier,
+		WorkloadType:                   orig.WorkloadType,
+		InterpolatedWorkloadIdentifier: taskEnv.ReplaceEnv(orig.WorkloadIdentifier),
 	}
-	identity := origIdentity.Copy()
-	identity.Name = taskEnv.ReplaceEnv(identity.Name)
-	identity.Audience = helper.ConvertSlice(identity.Audience,
-		func(aud string) string { return taskEnv.ReplaceEnv(aud) })
-	identity.ChangeMode = taskEnv.ReplaceEnv(identity.ChangeMode)
-	identity.ChangeSignal = taskEnv.ReplaceEnv(identity.ChangeSignal)
-	identity.ServiceName = taskEnv.ReplaceEnv(identity.ServiceName)
-
-	// note: can't interpolate Env, File, TTL
-
-	return identity
 }
